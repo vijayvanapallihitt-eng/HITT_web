@@ -47,10 +47,12 @@ VENV_PYTHON = str(PROJECT_ROOT / ".venv" / "Scripts" / "python.exe")
 from dotenv import load_dotenv as _load_dotenv
 _load_dotenv(dotenv_path=PROJECT_ROOT / ".env", override=False)
 
-_ENV_DSN = os.getenv("BROKER_CONSTRUCTION_DSN", "postgresql://postgres:postgres@localhost:5432/construction")
+_ENV_DSN = os.getenv("BROKER_CONSTRUCTION_DSN", "postgresql://postgres:postgres@localhost:5433/construction")
 _ENV_DB_NAME = _ENV_DSN.rsplit("/", 1)[-1] if "/" in _ENV_DSN else "construction"
 
-ADMIN_DSN = "postgresql://postgres:postgres@localhost:5432/postgres"
+# Derive host:port from the env DSN so everything stays consistent
+_parsed_dsn = _ENV_DSN.split("@")[-1].rsplit("/", 1)[0] if "@" in _ENV_DSN else "localhost:5433"
+ADMIN_DSN = f"postgresql://postgres:postgres@{_parsed_dsn}/postgres"
 
 
 def _list_pipeline_databases() -> list[str]:
@@ -73,7 +75,7 @@ def _list_pipeline_databases() -> list[str]:
     pipeline_dbs: list[str] = []
     for db_name in candidates:
         try:
-            c = psycopg2.connect(f"postgresql://postgres:postgres@localhost:5432/{db_name}")
+            c = psycopg2.connect(_dsn_for_db(db_name))
             c.autocommit = True
             cr = c.cursor()
             cr.execute("SELECT to_regclass('public.results')")
@@ -104,7 +106,7 @@ def _create_pipeline_database(db_name: str) -> str | None:
     except Exception as exc:
         return f"Failed to create database: {exc}"
 
-    dsn = f"postgresql://postgres:postgres@localhost:5432/{db_name}"
+    dsn = _dsn_for_db(db_name)
     try:
         conn = psycopg2.connect(dsn)
         conn.autocommit = False
@@ -146,8 +148,8 @@ def _create_pipeline_database(db_name: str) -> str | None:
 def _update_env_file(db_name: str) -> None:
     """Update .env so the pipeline workers also use this DB."""
     env_path = PROJECT_ROOT / ".env"
-    new_dsn = f"postgresql://postgres:postgres@localhost:5432/{db_name}"
-    new_docker_dsn = f"postgres://postgres:postgres@host.docker.internal:5432/{db_name}"
+    new_dsn = _dsn_for_db(db_name)
+    new_docker_dsn = _docker_dsn_for_db(db_name)
     keys_to_set = {
         "BROKER_CONSTRUCTION_DSN": new_dsn,
         "BROKER_DOCKER_CONSTRUCTION_DSN": new_docker_dsn,
@@ -172,11 +174,12 @@ def _update_env_file(db_name: str) -> None:
 
 
 def _dsn_for_db(db_name: str) -> str:
-    return f"postgresql://postgres:postgres@localhost:5432/{db_name}"
+    return f"postgresql://postgres:postgres@{_parsed_dsn}/{db_name}"
 
 
 def _docker_dsn_for_db(db_name: str) -> str:
-    return f"postgres://postgres:postgres@host.docker.internal:5432/{db_name}"
+    _docker_host = _parsed_dsn.replace("localhost", "host.docker.internal")
+    return f"postgres://postgres:postgres@{_docker_host}/{db_name}"
 
 
 def _scraper_container_name(db_name: str) -> str:
@@ -361,7 +364,7 @@ if page == "📊 Overview":
         ```
         ┌──────────────────┐     ┌────────────────────┐     ┌───────────────────────┐     ┌──────────────┐
         │  Google Maps     │     │  worker_enrich.py   │     │  run_document_ingest  │     │  ChromaDB    │
-        │  Scraper         │────▶│  (Bing + News)      │────▶│  (fetch/chunk/embed)  │────▶│  Vector DB   │
+        │  Scraper         │────▶│  (Google News)      │────▶│  (fetch/chunk/embed)  │────▶│  Vector DB   │
         │  (Docker)        │     │                     │     │                       │     │              │
         │                  │     │  results ──▶        │     │  link_candidates ──▶  │     │  query via   │
         │  ──▶ results     │     │  link_candidates    │     │  documents ──▶        │     │  Vector      │
@@ -442,7 +445,7 @@ if page == "📊 Overview":
             marker=dict(color=["#1e40af", "#2563eb", "#3b82f6", "#60a5fa", "#93c5fd", "#bfdbfe"]),
         ))
         fig_funnel.update_layout(title="Pipeline Funnel", height=380, margin=dict(t=40, b=20))
-        st.plotly_chart(fig_funnel, width='stretch')
+        st.plotly_chart(fig_funnel, use_container_width=True)
 
     with col_health:
         st.subheader("Data Health")
@@ -461,7 +464,9 @@ if page == "📊 Overview":
                                 hole=0.4)
             fig_health.update_layout(height=380, margin=dict(t=20, b=20),
                                      legend=dict(orientation="h", y=-0.15))
-            st.plotly_chart(fig_health, width='stretch')
+            st.plotly_chart(fig_health, use_container_width=True)
+        else:
+            st.info("No documents fetched yet.")
 
     # ── Two columns: category + state breakdown ────────────────────────
     col_left, col_right = st.columns(2)
@@ -478,7 +483,9 @@ if page == "📊 Overview":
                              color_discrete_sequence=["#2563eb"])
             fig_cat.update_layout(height=380, yaxis=dict(autorange="reversed"),
                                   xaxis_title="Companies", yaxis_title="")
-            st.plotly_chart(fig_cat, width='stretch')
+            st.plotly_chart(fig_cat, use_container_width=True)
+        else:
+            st.info("No category data yet.")
 
     with col_right:
         st.subheader("Top States")
@@ -494,7 +501,9 @@ if page == "📊 Overview":
                             color_discrete_sequence=["#059669"])
             fig_st.update_layout(height=380, yaxis=dict(autorange="reversed"),
                                  xaxis_title="Companies", yaxis_title="")
-            st.plotly_chart(fig_st, width='stretch')
+            st.plotly_chart(fig_st, use_container_width=True)
+        else:
+            st.info("No state data yet.")
 
     # ── Worker status ──────────────────────────────────────────────────
     st.subheader("Worker Status")
@@ -762,12 +771,15 @@ elif page == "⚙️ Enrichment Monitor":
     with col_left:
         st.subheader("Document Fetch Status")
         fetch_df = run_query("SELECT fetch_status, count(*) AS cnt FROM documents GROUP BY 1 ORDER BY 2 DESC")
-        colors = {"ok": "#22c55e", "http_error": "#ef4444", "request_error": "#f97316",
-                  "irrelevant": "#a3a3a3", "empty_text": "#eab308", "unsupported_content_type": "#8b5cf6"}
-        fig_fs = px.pie(fetch_df, values="cnt", names="fetch_status",
-                        color="fetch_status", color_discrete_map=colors)
-        fig_fs.update_layout(height=350)
-        st.plotly_chart(fig_fs, width='stretch')
+        if fetch_df.empty:
+            st.info("No documents fetched yet — run the ingester to populate this chart.")
+        else:
+            colors = {"ok": "#22c55e", "http_error": "#ef4444", "request_error": "#f97316",
+                      "irrelevant": "#a3a3a3", "empty_text": "#eab308", "unsupported_content_type": "#8b5cf6"}
+            fig_fs = px.pie(fetch_df, values="cnt", names="fetch_status",
+                            color="fetch_status", color_discrete_map=colors)
+            fig_fs.update_layout(height=350)
+            st.plotly_chart(fig_fs, use_container_width=True)
 
     with col_right:
         st.subheader("Link Discovery Breakdown")
@@ -775,11 +787,14 @@ elif page == "⚙️ Enrichment Monitor":
             SELECT source_type, discovery_status, count(*) AS cnt
             FROM link_candidates GROUP BY 1, 2 ORDER BY 1, 3 DESC
         """)
-        fig_disc = px.bar(disc_df, x="source_type", y="cnt", color="discovery_status",
-                          barmode="group",
-                          color_discrete_sequence=["#2563eb", "#f97316", "#ef4444", "#a3a3a3"])
-        fig_disc.update_layout(height=350, xaxis_title="", yaxis_title="Count")
-        st.plotly_chart(fig_disc, width='stretch')
+        if disc_df.empty:
+            st.info("No link candidates yet — run the enricher to populate this chart.")
+        else:
+            fig_disc = px.bar(disc_df, x="source_type", y="cnt", color="discovery_status",
+                              barmode="group",
+                              color_discrete_sequence=["#2563eb", "#f97316", "#ef4444", "#a3a3a3"])
+            fig_disc.update_layout(height=350, xaxis_title="", yaxis_title="Count")
+            st.plotly_chart(fig_disc, use_container_width=True)
 
     st.divider()
     st.subheader("Recently Enriched")
@@ -790,12 +805,14 @@ elif page == "⚙️ Enrichment Monitor":
         ORDER BY lc.discovered_at DESC NULLS LAST LIMIT 30
     """)
     if not recent.empty:
-        st.dataframe(recent, width='stretch', hide_index=True, column_config={
+        st.dataframe(recent, use_container_width=True, hide_index=True, column_config={
             "result_id": "ID", "company": "Company", "source_type": "Type",
             "discovery_status": "Status",
             "discovered_at": st.column_config.DatetimeColumn("Discovered", format="YYYY-MM-DD HH:mm"),
             "url_discovered": st.column_config.LinkColumn("URL"),
         })
+    else:
+        st.info("No enrichment activity yet — run the enricher worker to discover links.")
 
     st.divider()
     st.subheader("Recently Fetched Documents")
@@ -809,13 +826,15 @@ elif page == "⚙️ Enrichment Monitor":
         ORDER BY d.fetched_at DESC NULLS LAST LIMIT 30
     """)
     if not recent_docs.empty:
-        st.dataframe(recent_docs, width='stretch', hide_index=True, column_config={
+        st.dataframe(recent_docs, use_container_width=True, hide_index=True, column_config={
             "doc_id": "Doc ID", "company": "Company", "fetch_status": "Status",
             "page_title": "Page Title",
             "url_fetched": st.column_config.LinkColumn("URL"),
             "fetched_at": st.column_config.DatetimeColumn("Fetched", format="YYYY-MM-DD HH:mm"),
             "chunks": "Chunks",
         })
+    else:
+        st.info("No documents fetched yet — run the ingester to populate this table.")
 
     st.divider()
     st.subheader("Worker Status JSON")
@@ -878,7 +897,7 @@ elif page == "🧠 Vector Search":
                             height=380, yaxis=dict(autorange="reversed"),
                             xaxis_title="Chunks", yaxis_title="",
                         )
-                        st.plotly_chart(fig_comp, width='stretch')
+                        st.plotly_chart(fig_comp, use_container_width=True)
 
                 with stat_col2:
                     if "source_type" in meta_df.columns:
@@ -891,7 +910,7 @@ elif page == "🧠 Vector Search":
                             hole=0.4,
                         )
                         fig_src.update_layout(height=380)
-                        st.plotly_chart(fig_src, width='stretch')
+                        st.plotly_chart(fig_src, use_container_width=True)
 
     st.divider()
 
@@ -917,7 +936,12 @@ elif page == "🧠 Vector Search":
     with search_col4:
         get_answer = st.checkbox("🤖 Get AI answer", value=False)
 
-    if st.button("🔍 Search", type="primary") and query_text.strip():
+    _openai_available = get_openai_client() is not None
+    if not _openai_available:
+        st.warning("⚠️ **OPENAI_API_KEY** not set in `.env` — vector search requires an embedding key. "
+                   "Add `OPENAI_API_KEY=sk-...` to your `.env` file and refresh.")
+
+    if st.button("🔍 Search", type="primary", disabled=not _openai_available) and query_text.strip():
         with st.spinner("Embedding query and searching…"):
             try:
                 query_emb = embed_query(query_text)
@@ -1049,7 +1073,9 @@ elif page == "🚀 Scrape Queries":
                 jc2.metric("Completed", f"{int(row.cnt):,}")
             elif row["status"] in ("new", "queued"):
                 jc3.metric("Pending", f"{int(row.cnt):,}")
-    st.dataframe(jobs_stats, width='stretch', hide_index=True)
+    else:
+        st.info("No scraper jobs yet — seed queries to create jobs.")
+    st.dataframe(jobs_stats, use_container_width=True, hide_index=True)
 
     # ── Live Scraper Status ────────────────────────────────────────────
     st.divider()
@@ -1250,9 +1276,9 @@ elif page == "🚀 Scrape Queries":
             f' --fetch-batch 25 --chunk-batch 25 --poll 10'
             f' --persist-dir runtime/chroma/chroma_smoke_db'
             f' --collection {COLLECTION_NAME}'
-            f' --embedding-backend openai --embedding-model {EMBEDDING_MODEL}'
+            f' --embedding-backend simple --embedding-model {EMBEDDING_MODEL}'
             f' --env-file .env'
-            f' --status-file runtime/status/run_document_ingest_status_openai.json'
+            f' --status-file runtime/status/run_document_ingest_status.json'
         )
         subprocess.Popen(ingest_cmd, cwd=str(PROJECT_ROOT), shell=True,
                          creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
@@ -1357,9 +1383,9 @@ elif page == "🚀 Scrape Queries":
                 f' --fetch-batch {ingest_fetch} --chunk-batch {ingest_chunk} --poll {ingest_poll}'
                 f' --persist-dir runtime/chroma/chroma_smoke_db'
                 f' --collection {COLLECTION_NAME}'
-                f' --embedding-backend openai --embedding-model {EMBEDDING_MODEL}'
+                f' --embedding-backend simple --embedding-model {EMBEDDING_MODEL}'
                 f' --env-file .env'
-                f' --status-file runtime/status/run_document_ingest_status_openai.json'
+                f' --status-file runtime/status/run_document_ingest_status.json'
             )
             subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), shell=True,
                              creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
@@ -1430,7 +1456,7 @@ elif page == "🚀 Scrape Queries":
 
 # ── Sidebar footer ─────────────────────────────────────────────────────
 st.sidebar.divider()
-st.sidebar.caption(f"DB: `{_active_db()}` @ localhost:5432")
+st.sidebar.caption(f"DB: `{_active_db()}` @ {_parsed_dsn}")
 st.sidebar.caption(f"Chroma: `{COLLECTION_NAME}`")
 try:
     _footer_count = run_scalar('SELECT count(*) FROM results')
