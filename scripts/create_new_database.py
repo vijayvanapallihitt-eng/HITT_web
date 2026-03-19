@@ -62,7 +62,7 @@ def create_results_table(dsn: str) -> None:
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS results (
-            id SERIAL PRIMARY KEY,
+            id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             data JSONB NOT NULL DEFAULT '{}'
         )
     """)

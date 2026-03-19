@@ -46,6 +46,7 @@ services:
       - broker_runtime:/app/runtime
       - ./queries:/app/queries
       - ./data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
 
 volumes:
   pgdata:

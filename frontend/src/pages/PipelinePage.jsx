@@ -6,6 +6,7 @@ import {
   Loader2, Play, Square, Search, FileText, Layers,
   CheckCircle2, AlertCircle, Zap, ChevronDown,
   ChevronUp, MapPin, Sparkles, Link2, Database,
+  Clock, Globe, Newspaper, Box, Activity,
 } from 'lucide-react'
 
 // ── Trades for the query generator ──────────────────────────────────
@@ -152,6 +153,72 @@ export default function PipelinePage() {
   const enriched    = stats?.results_enriched || 0
   const pending     = stats?.results_pending || 0
   const pct = totalResults > 0 ? Math.round((enriched / totalResults) * 100) : 0
+
+  // ── Scraper logs (live, only when running) ─────────────────────────
+  const { data: scraperLogs } = useQuery({
+    queryKey: ['scraperLogs', activeDb],
+    queryFn: () => api.getScraperLogs(activeDb, 30).catch(() => ({ logs: '' })),
+    enabled: !!activeDb && isRunning,
+    refetchInterval: 4_000,
+  })
+
+  // Parse scraper log into meaningful events
+  const scraperEvents = useMemo(() => {
+    if (!scraperLogs?.logs) return []
+    return scraperLogs.logs
+      .split('\n')
+      .filter(l => l.trim())
+      .map(line => {
+        try {
+          const j = JSON.parse(line)
+          if (j.message === 'scrapemate stats') {
+            return { type: 'stats', jobs: j.numOfJobsCompleted, failed: j.numOfJobsFailed, speed: j.speed, time: j.time }
+          }
+          if (j.message?.includes('exiting')) {
+            return { type: 'exit', msg: 'Scraper finished — no more jobs', time: j.time }
+          }
+          if (j.message === 'starting scrapemate') {
+            return { type: 'start', msg: 'Scraper started', time: j.time }
+          }
+          return null
+        } catch {
+          if (line.includes('INFO Downloading driver')) return { type: 'info', msg: 'Downloading browser…' }
+          if (line.includes('Downloaded driver')) return { type: 'info', msg: 'Browser ready' }
+          if (line.includes('Downloaded browsers')) return { type: 'info', msg: 'Browser setup complete' }
+          return null
+        }
+      })
+      .filter(Boolean)
+  }, [scraperLogs?.logs])
+
+  // Derive a human-readable phase
+  const currentPhase = useMemo(() => {
+    if (!isRunning) return null
+    const scraperExited = scraperEvents.some(e => e.type === 'exit')
+    const scraperHasStats = scraperEvents.filter(e => e.type === 'stats')
+    const lastStat = scraperHasStats[scraperHasStats.length - 1]
+
+    if (scraperRunning && (!lastStat || lastStat.jobs === 0)) {
+      return { icon: Search, label: 'Searching Google Maps…', detail: 'Looking for companies matching your queries', color: 'blue' }
+    }
+    if (scraperRunning && lastStat?.jobs > 0) {
+      return { icon: Search, label: `Found ${lastStat.jobs} companies so far`, detail: `Speed: ${lastStat.speed}`, color: 'blue' }
+    }
+    if (scraperExited && pipelineRunning && totals.companies_processed === 0) {
+      return { icon: Clock, label: 'Scraper finished, enrichment starting…', detail: `${totalResults} companies to process`, color: 'amber' }
+    }
+    if (pipelineRunning && totals.companies_processed > 0) {
+      const phaseParts = []
+      if (totals.news_links > 0) phaseParts.push(`${totals.news_links} news articles`)
+      if (totals.website_pages > 0) phaseParts.push(`${totals.website_pages} web pages`)
+      if (totals.chunks_embedded > 0) phaseParts.push(`${totals.chunks_embedded} chunks embedded`)
+      return { icon: Zap, label: `Processing company ${totals.companies_processed} of ${totalResults || '?'}`, detail: phaseParts.join(' • ') || 'Gathering data…', color: 'emerald' }
+    }
+    if (pipelineRunning) {
+      return { icon: Clock, label: 'Waiting for companies…', detail: 'The scraper will feed results to the pipeline', color: 'gray' }
+    }
+    return { icon: Activity, label: 'Running…', detail: '', color: 'blue' }
+  }, [isRunning, scraperRunning, pipelineRunning, scraperEvents, totals, totalResults])
 
   const queryCount = useMemo(
     () => queries.trim().split('\n').filter(l => l.trim()).length,
@@ -315,14 +382,14 @@ export default function PipelinePage() {
               <h3 className="text-lg font-semibold text-white">
                 {isRunning ? 'Pipeline Running' : 'Ready to Run'}
               </h3>
-              {isRunning && (
-                <p className="text-xs text-gray-500 flex items-center gap-1">
-                  {scraperRunning && pipelineRunning
-                    ? '🔍 Scraping + enriching'
-                    : scraperRunning
-                      ? '🔍 Scraping for leads…'
-                      : '⚡ Enriching & embedding…'}
-                </p>
+              {isRunning && currentPhase && (
+                <div className="flex items-center gap-2 mt-0.5">
+                  <currentPhase.icon size={13} className={`text-${currentPhase.color}-400`} />
+                  <p className="text-sm text-gray-300 font-medium">{currentPhase.label}</p>
+                </div>
+              )}
+              {isRunning && currentPhase?.detail && (
+                <p className="text-xs text-gray-500 mt-0.5">{currentPhase.detail}</p>
               )}
             </div>
           </div>
@@ -341,7 +408,6 @@ export default function PipelinePage() {
               </button>
             ) : (
               <div className="flex items-center gap-2">
-                {/* Enrich-only button (when scraper already loaded data) */}
                 {totalResults > 0 && pending > 0 && (
                   <button
                     onClick={() => startEnrich.mutate()}
@@ -354,8 +420,6 @@ export default function PipelinePage() {
                     Enrich Only
                   </button>
                 )}
-
-                {/* Main run button */}
                 <button
                   onClick={() => runPipeline.mutate()}
                   disabled={runPipeline.isPending || (!queries.trim() && pending === 0)}
@@ -394,31 +458,98 @@ export default function PipelinePage() {
             ⚡ {pending.toLocaleString()} companies still pending
           </p>
         )}
-        {pending === 0 && totalResults > 0 && (
+        {pending === 0 && totalResults > 0 && !isRunning && (
           <p className="text-xs text-emerald-400 mt-2 flex items-center gap-1">
             <CheckCircle2 size={12} /> All companies processed
           </p>
         )}
 
-        {/* Session stats (live) */}
-        {isRunning && totals.companies_processed > 0 && (
-          <div className="mt-4 pt-3 border-t border-gray-800/60 grid grid-cols-4 gap-3 text-center text-xs">
-            <div>
-              <div className="text-lg font-bold text-white">{totals.companies_processed}</div>
-              <div className="text-gray-500">Processed</div>
+        {/* ── Live activity panel (only while running) ─────────── */}
+        {isRunning && (
+          <div className="mt-4 pt-4 border-t border-gray-800/60 space-y-4">
+
+            {/* 4-column live counters */}
+            <div className="grid grid-cols-4 gap-3">
+              <div className="bg-gray-800/60 rounded-lg p-3 text-center">
+                <div className="flex items-center justify-center gap-1.5 text-[10px] text-gray-500 mb-1">
+                  <Search size={10} /> FOUND
+                </div>
+                <div className="text-xl font-bold text-blue-400">{totalResults || '—'}</div>
+                <div className="text-[10px] text-gray-600">companies</div>
+              </div>
+              <div className="bg-gray-800/60 rounded-lg p-3 text-center">
+                <div className="flex items-center justify-center gap-1.5 text-[10px] text-gray-500 mb-1">
+                  <Newspaper size={10} /> NEWS
+                </div>
+                <div className="text-xl font-bold text-green-400">{totals.news_links || '—'}</div>
+                <div className="text-[10px] text-gray-600">articles</div>
+              </div>
+              <div className="bg-gray-800/60 rounded-lg p-3 text-center">
+                <div className="flex items-center justify-center gap-1.5 text-[10px] text-gray-500 mb-1">
+                  <Globe size={10} /> PAGES
+                </div>
+                <div className="text-xl font-bold text-amber-400">{totals.docs_ok || '—'}</div>
+                <div className="text-[10px] text-gray-600">fetched</div>
+              </div>
+              <div className="bg-gray-800/60 rounded-lg p-3 text-center">
+                <div className="flex items-center justify-center gap-1.5 text-[10px] text-gray-500 mb-1">
+                  <Box size={10} /> CHUNKS
+                </div>
+                <div className="text-xl font-bold text-purple-400">{totals.chunks_embedded || '—'}</div>
+                <div className="text-[10px] text-gray-600">embedded</div>
+              </div>
             </div>
-            <div>
-              <div className="text-lg font-bold text-green-400">{totals.news_links}</div>
-              <div className="text-gray-500">News links</div>
+
+            {/* Step-by-step pipeline phases */}
+            <div className="space-y-1">
+              <p className="text-[10px] uppercase tracking-widest text-gray-500 font-semibold mb-2">Pipeline Steps</p>
+              {[
+                { icon: Search,    label: 'Find companies on Google Maps',      done: !scraperRunning && (totalResults > 0 || scraperEvents.some(e => e.type === 'exit')), active: scraperRunning },
+                { icon: Newspaper, label: 'Discover news articles',              done: totals.news_links > 0 && !scraperRunning, active: pipelineRunning && totals.companies_processed > 0 && totals.news_links === 0 },
+                { icon: Globe,     label: 'Fetch websites & documents',          done: totals.docs_ok > 0 && pending === 0, active: pipelineRunning && totals.news_links > 0 },
+                { icon: Box,       label: 'Chunk & embed for search',            done: totals.chunks_embedded > 0 && pending === 0, active: pipelineRunning && totals.docs_ok > 0 },
+              ].map((step, i) => (
+                <div key={i} className={`flex items-center gap-3 px-3 py-2 rounded-lg text-sm ${
+                  step.active ? 'bg-emerald-950/30 text-emerald-300' :
+                  step.done   ? 'text-gray-500' :
+                                'text-gray-600'
+                }`}>
+                  <div className="w-5 flex justify-center">
+                    {step.active ? <Loader2 size={14} className="animate-spin text-emerald-400" /> :
+                     step.done   ? <CheckCircle2 size={14} className="text-emerald-600" /> :
+                                   <div className="w-2 h-2 rounded-full bg-gray-700" />}
+                  </div>
+                  <step.icon size={14} />
+                  <span>{step.label}</span>
+                  {step.active && <span className="ml-auto text-[10px] text-emerald-500 animate-pulse">in progress</span>}
+                </div>
+              ))}
             </div>
-            <div>
-              <div className="text-lg font-bold text-amber-400">{totals.docs_ok}</div>
-              <div className="text-gray-500">Docs fetched</div>
-            </div>
-            <div>
-              <div className="text-lg font-bold text-purple-400">{totals.chunks_embedded}</div>
-              <div className="text-gray-500">Chunks</div>
-            </div>
+
+            {/* Scraper live log */}
+            {scraperEvents.length > 0 && (
+              <div>
+                <p className="text-[10px] uppercase tracking-widest text-gray-500 font-semibold mb-2">Scraper Log</p>
+                <div className="bg-gray-950 rounded-lg border border-gray-800 p-3 max-h-32 overflow-y-auto font-mono text-[11px] text-gray-400 space-y-0.5">
+                  {scraperEvents.map((e, i) => (
+                    <div key={i} className={
+                      e.type === 'exit' ? 'text-amber-400' :
+                      e.type === 'stats' ? 'text-gray-500' :
+                      e.type === 'start' ? 'text-emerald-500' :
+                      'text-gray-500'
+                    }>
+                      {e.type === 'stats'
+                        ? `📊 ${e.jobs} jobs done, ${e.failed} failed — ${e.speed}`
+                        : e.type === 'exit'
+                          ? `⏹ ${e.msg}`
+                          : e.type === 'start'
+                            ? `▶ ${e.msg}`
+                            : `ℹ ${e.msg}`}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         )}
 

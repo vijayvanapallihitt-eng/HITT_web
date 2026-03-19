@@ -9,7 +9,8 @@ Find and research companies automatically. Enter what you're looking for, and Br
 ### What You Need
 
 1. **Docker Desktop** — download free from [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/)  
-   Install it, open it, and make sure it says **"Docker Desktop is running"** in the bottom-left corner.
+   Install it, open it, and make sure it says **"Docker Desktop is running"** in the bottom-left corner.  
+   > ⚠️ Docker Desktop must stay running the whole time — the pipeline launches scraper containers through it.
 
 2. **An OpenAI API key** — you should have been given one. It looks like `sk-proj-...`
 
@@ -112,6 +113,7 @@ Anyone on the same WiFi or network can use the dashboard.
 | "Failed to fetch" error on the page | The server is restarting — wait a moment and try again |
 | 500 error when creating a database | Postgres is still starting — wait 10 seconds and retry |
 | Pipeline isn't finding companies | Make sure Docker Desktop is running — the scraper needs it |
+| Pipeline finds companies but 0 in Results | The `results` table schema may be wrong — recreate the database from the dashboard |
 | Ask tab says "no results" | Run the Pipeline first — it needs data before you can search |
 | Can't connect from another computer | Windows Firewall is blocking port 8000 (see section above) |
 
@@ -265,12 +267,24 @@ _Everything below is for developers only._
 │   │ Worker       │    │  /app/runtime/chroma  │ │
 │   └──────┬───────┘    └───────────────────────┘ │
 │          │                                       │
+│   Docker CLI  ──── /var/run/docker.sock ─────────┤
+│          │                                       │
 └──────────┼───────────────────────────────────────┘
+           │
+     ┌─────▼────────────────────────────────┐
+     │  Google Maps Scraper (ephemeral)     │
+     │  gosom/google-maps-scraper:latest    │
+     │  (launched on-demand per pipeline)   │
+     └─────┬────────────────────────────────┘
            │
 ┌──────────▼───────────────────────────────────────┐
 │            PostgreSQL Container                   │
 │            (all lead data, documents)             │
 │            port 5432                              │
+│                                                  │
+│   Tables: results, gmaps_jobs,                   │
+│           link_candidates, documents,             │
+│           document_chunks                         │
 └──────────────────────────────────────────────────┘
 ```
 
@@ -281,9 +295,11 @@ _Everything below is for developers only._
 | **FastAPI Server** | REST API — handles all dashboard requests |
 | **React Frontend** | The web UI you see in the browser |
 | **Unified Pipeline** | Scrapes Google Maps, discovers news, fetches websites, chunks & embeds documents |
-| **PostgreSQL** | Stores company data, links, documents |
+| **Google Maps Scraper** | Separate Docker container (`gosom/google-maps-scraper`) launched on-demand. Finds companies and writes to PostgreSQL |
+| **PostgreSQL** | Stores company data (`results`), job queue (`gmaps_jobs`), links, documents |
 | **ChromaDB** | Stores vector embeddings for semantic search |
 | **OpenAI API** | Generates embeddings (`text-embedding-3-small`) and AI answers (`gpt-4o-mini`) |
+| **Docker Socket** | Host Docker socket mounted into broker so it can launch/manage scraper containers |
 
 ## Local Development (without Docker)
 
