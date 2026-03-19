@@ -70,6 +70,8 @@ export const api = {
     request('/scraper/start', { method: 'POST', body: JSON.stringify({ db, ...opts }) }),
   stopScraper: (db) =>
     request('/scraper/stop', { method: 'POST', body: JSON.stringify({ db }) }),
+  stopAllScrapers: () =>
+    request('/scraper/stop-all', { method: 'POST' }),
   getScraperLogs: (db, tail = 50) => request(`/scraper/logs?db=${db}&tail=${tail}`),
 
   // ── Workers ───────────────────────────────────────────
@@ -83,6 +85,8 @@ export const api = {
     request('/workers/unified/start', { method: 'POST', body: JSON.stringify({ db, ...opts }) }),
   stopWorker: (db, worker) =>
     request('/workers/stop', { method: 'POST', body: JSON.stringify({ db, worker }) }),
+  stopAllWorkers: () =>
+    request('/workers/stop-all', { method: 'POST' }),
 
   // ── Queries ───────────────────────────────────────────
   getQueryFiles: () => request('/queries'),

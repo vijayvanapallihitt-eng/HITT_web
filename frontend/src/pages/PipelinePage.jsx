@@ -6,7 +6,7 @@ import {
   Loader2, Play, Square, Search, FileText, Layers,
   CheckCircle2, AlertCircle, Zap, ChevronDown,
   ChevronUp, MapPin, Sparkles, Link2, Database,
-  Clock, Globe, Newspaper, Box, Activity,
+  Clock, Globe, Newspaper, Box, Activity, OctagonX,
 } from 'lucide-react'
 
 // ── Trades for the query generator ──────────────────────────────────
@@ -135,17 +135,63 @@ export default function PipelinePage() {
     },
   })
 
-  // ── Derived state ─────────────────────────────────────────────────
+  const stopAllPipelines = useMutation({
+    mutationFn: async () => {
+      await api.stopAllWorkers().catch(() => {})
+      await api.stopAllScrapers().catch(() => {})
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['workerProcesses'] })
+      qc.invalidateQueries({ queryKey: ['scraperStatus'] })
+    },
+  })
+
+  // ── Derived state (per-database) ──────────────────────────────────
   const pipelineRunning = procs?.processes?.some(
-    p => p.CommandLine?.includes('worker_unified')
+    p => p.CommandLine?.includes('worker_unified') && p.CommandLine?.includes(activeDb)
   )
   const scraperRunning = scraperStatus?.containers?.some(
-    c => c.status?.toLowerCase().includes('up')
+    c => c.status?.toLowerCase().includes('up') && c.name?.startsWith(`${activeDb}-scraper`)
   )
   const isRunning = pipelineRunning || scraperRunning
 
+  // Track ALL active pipelines (for other-DB awareness)
+  const allRunningWorkerDbs = useMemo(() => {
+    if (!procs?.processes) return []
+    return [...new Set(
+      procs.processes
+        .filter(p => p.CommandLine?.includes('worker_unified'))
+        .map(p => {
+          const m = p.CommandLine?.match(/\/([^/]+)$/)
+          if (m) return m[1]
+          // Try to extract DB name from --dsn flag
+          const dsnMatch = p.CommandLine?.match(/\/([\w-]+?)(?:["']|\s|$)/)
+          return dsnMatch ? dsnMatch[1] : null
+        })
+        .filter(Boolean)
+    )]
+  }, [procs?.processes])
+
+  const allRunningScraperDbs = useMemo(() => {
+    if (!scraperStatus?.containers) return []
+    return [...new Set(
+      scraperStatus.containers
+        .filter(c => c.status?.toLowerCase().includes('up'))
+        .map(c => c.name?.replace(/-scraper$/, ''))
+        .filter(Boolean)
+    )]
+  }, [scraperStatus?.containers])
+
+  const otherRunningDbs = useMemo(() => {
+    const allDbs = new Set([...allRunningWorkerDbs, ...allRunningScraperDbs])
+    allDbs.delete(activeDb)
+    return [...allDbs]
+  }, [allRunningWorkerDbs, allRunningScraperDbs, activeDb])
+
+  const anyGlobalRunning = allRunningWorkerDbs.length > 0 || allRunningScraperDbs.length > 0
+
   const unifiedStatus = workers?.statuses?.find(s =>
-    s._filename?.includes('unified') || s.worker === 'unified_pipeline'
+    s._filename === `unified_${activeDb}.json`
   )
   const totals = unifiedStatus?.totals || {}
 
@@ -362,6 +408,31 @@ export default function PipelinePage() {
         </div>
       </section>
 
+      {/* ── Other pipelines running banner ──────────────────── */}
+      {otherRunningDbs.length > 0 && (
+        <div className="rounded-xl border border-amber-700/40 bg-amber-950/20 px-5 py-3 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Activity size={14} className="text-amber-400" />
+            <span className="text-sm text-amber-300">
+              Pipelines running on {otherRunningDbs.length === 1 ? 'another database' : `${otherRunningDbs.length} other databases`}:
+            </span>
+            <span className="text-sm text-amber-400 font-medium">
+              {otherRunningDbs.join(', ')}
+            </span>
+          </div>
+          <button
+            onClick={() => stopAllPipelines.mutate()}
+            disabled={stopAllPipelines.isPending}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-600/20 text-red-400 border border-red-700/50 text-xs font-medium hover:bg-red-600/30 transition-colors disabled:opacity-50"
+          >
+            {stopAllPipelines.isPending
+              ? <Loader2 size={12} className="animate-spin" />
+              : <OctagonX size={12} />}
+            Stop All
+          </button>
+        </div>
+      )}
+
       {/* ━━━━━━━━━ Step 2 — Run / Status ━━━━━━━━━━━━━━━━━━━━━━ */}
       <section className={`rounded-xl border-2 p-6 transition-colors ${
         isRunning
@@ -396,16 +467,30 @@ export default function PipelinePage() {
 
           <div className="flex items-center gap-2">
             {isRunning ? (
-              <button
-                onClick={() => stopPipeline.mutate()}
-                disabled={stopPipeline.isPending}
-                className="flex items-center gap-2 px-5 py-2.5 rounded-lg bg-red-600/20 text-red-400 border border-red-700/50 text-sm font-medium hover:bg-red-600/30 transition-colors disabled:opacity-50"
-              >
-                {stopPipeline.isPending
-                  ? <Loader2 size={16} className="animate-spin" />
-                  : <Square size={16} />}
-                Stop
-              </button>
+              <>
+                {otherRunningDbs.length > 0 && (
+                  <button
+                    onClick={() => stopAllPipelines.mutate()}
+                    disabled={stopAllPipelines.isPending}
+                    className="flex items-center gap-2 px-4 py-2.5 rounded-lg bg-red-900/30 text-red-500 border border-red-800/50 text-xs font-medium hover:bg-red-900/40 transition-colors disabled:opacity-50"
+                  >
+                    {stopAllPipelines.isPending
+                      ? <Loader2 size={14} className="animate-spin" />
+                      : <OctagonX size={14} />}
+                    Stop All ({otherRunningDbs.length + 1})
+                  </button>
+                )}
+                <button
+                  onClick={() => stopPipeline.mutate()}
+                  disabled={stopPipeline.isPending}
+                  className="flex items-center gap-2 px-5 py-2.5 rounded-lg bg-red-600/20 text-red-400 border border-red-700/50 text-sm font-medium hover:bg-red-600/30 transition-colors disabled:opacity-50"
+                >
+                  {stopPipeline.isPending
+                    ? <Loader2 size={16} className="animate-spin" />
+                    : <Square size={16} />}
+                  Stop
+                </button>
+              </>
             ) : (
               <div className="flex items-center gap-2">
                 {totalResults > 0 && pending > 0 && (

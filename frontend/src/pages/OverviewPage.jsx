@@ -1,8 +1,9 @@
+import { useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { useDb } from '../DbContext'
 import { api } from '../api'
-import { Database, Link2, FileText, Layers, Loader2, AlertCircle, Zap, Play, ArrowRight } from 'lucide-react'
+import { Database, Link2, FileText, Layers, Loader2, AlertCircle, Zap, Play, ArrowRight, Activity } from 'lucide-react'
 
 function StatCard({ icon: Icon, label, value, sub, color = 'blue' }) {
   const colors = {
@@ -39,10 +40,39 @@ export default function OverviewPage() {
     refetchInterval: 10_000,
   })
 
+  const { data: scraperStatus } = useQuery({
+    queryKey: ['scraperStatus'],
+    queryFn: () => api.getScraperStatus(),
+    refetchInterval: 10_000,
+  })
+
   const { data: collections } = useQuery({
     queryKey: ['collections'],
     queryFn: () => api.getCollections(),
   })
+
+  const pipelineRunning = workers?.processes?.some(
+    p => p.CommandLine?.includes('worker_unified') && p.CommandLine?.includes(activeDb)
+  )
+  const scraperRunning = scraperStatus?.containers?.some(
+    c => c.status?.toLowerCase().includes('up') && c.name?.startsWith(`${activeDb}-scraper`)
+  )
+  const isRunning = pipelineRunning || scraperRunning
+
+  // Other databases with active pipelines
+  const otherRunningDbs = useMemo(() => {
+    const workerDbs = (workers?.processes || [])
+      .filter(p => p.CommandLine?.includes('worker_unified'))
+      .map(p => { const m = p.CommandLine?.match(/\/([\w-]+?)(?:["']|\s|$)/); return m ? m[1] : null })
+      .filter(Boolean)
+    const scraperDbs = (scraperStatus?.containers || [])
+      .filter(c => c.status?.toLowerCase().includes('up'))
+      .map(c => c.name?.replace(/-scraper$/, ''))
+      .filter(Boolean)
+    const allDbs = new Set([...workerDbs, ...scraperDbs])
+    allDbs.delete(activeDb)
+    return [...allDbs]
+  }, [workers?.processes, scraperStatus?.containers, activeDb])
 
   if (!activeDb) return <div className="text-gray-500">Select a database from the sidebar.</div>
   if (isLoading) return <div className="flex items-center gap-2 text-gray-400"><Loader2 className="animate-spin" size={16} /> Loading…</div>
@@ -69,13 +99,13 @@ export default function OverviewPage() {
 
       {/* Pipeline status — quick view */}
       <div className={`rounded-xl border-2 p-5 transition-colors ${
-        workers?.processes?.some(p => p.CommandLine?.includes('worker_unified'))
+        isRunning
           ? 'border-emerald-500/40 bg-emerald-950/20'
           : 'border-gray-800 bg-gray-900/60'
       }`}>
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
-            {workers?.processes?.some(p => p.CommandLine?.includes('worker_unified')) ? (
+            {isRunning ? (
               <div className="relative">
                 <Zap size={20} className="text-emerald-400" />
                 <span className="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 bg-emerald-400 rounded-full animate-pulse" />
@@ -85,7 +115,7 @@ export default function OverviewPage() {
             )}
             <div>
               <h3 className="text-sm font-semibold text-white">
-                {workers?.processes?.some(p => p.CommandLine?.includes('worker_unified'))
+                {isRunning
                   ? 'Pipeline Running'
                   : 'Pipeline Idle'}
               </h3>
@@ -100,7 +130,7 @@ export default function OverviewPage() {
             onClick={() => navigate('/pipeline')}
             className="flex items-center gap-2 px-4 py-2 rounded-lg bg-gray-800 text-gray-200 text-sm hover:bg-gray-700 transition-colors"
           >
-            {workers?.processes?.some(p => p.CommandLine?.includes('worker_unified'))
+            {isRunning
               ? 'View Pipeline'
               : 'Start Pipeline'}
             <ArrowRight size={14} />
@@ -113,7 +143,7 @@ export default function OverviewPage() {
             <div className="w-full bg-gray-800 rounded-full h-2 overflow-hidden">
               <div
                 className={`h-full rounded-full transition-all duration-500 ${
-                  workers?.processes?.some(p => p.CommandLine?.includes('worker_unified'))
+                  isRunning
                     ? 'bg-emerald-500' : 'bg-blue-500'
                 }`}
                 style={{
@@ -127,6 +157,22 @@ export default function OverviewPage() {
           </div>
         )}
       </div>
+
+      {/* Other active pipelines */}
+      {otherRunningDbs.length > 0 && (
+        <div className="rounded-xl border border-amber-700/40 bg-amber-950/20 px-5 py-3 flex items-center gap-2">
+          <Activity size={14} className="text-amber-400" />
+          <span className="text-sm text-amber-300">
+            Also running on: <span className="text-amber-400 font-medium">{otherRunningDbs.join(', ')}</span>
+          </span>
+          <button
+            onClick={() => navigate('/pipeline')}
+            className="ml-auto text-xs text-gray-400 hover:text-white transition-colors"
+          >
+            Manage →
+          </button>
+        </div>
+      )}
 
       {/* Pending work + Workers */}
       <div className="grid grid-cols-2 gap-4">

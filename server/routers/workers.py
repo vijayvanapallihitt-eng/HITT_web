@@ -168,6 +168,25 @@ def stop_worker(req: StopWorkerRequest):
         raise HTTPException(500, f"Failed to stop {req.worker}: {e}")
 
 
+@router.post("/stop-all")
+def stop_all_workers():
+    """Stop ALL worker processes across all databases."""
+    targets = ["worker_enrich", "run_document_ingest", "worker_unified", "worker_evaluate"]
+    killed = []
+    for target in targets:
+        try:
+            r = subprocess.run(
+                ["powershell", "-Command",
+                 f"Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{target}*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force; $_.ProcessId }}"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if r.stdout.strip():
+                killed.extend(r.stdout.strip().splitlines())
+        except Exception:
+            pass
+    return {"status": "stopped", "killed_pids": killed}
+
+
 @router.get("/processes")
 def list_python_processes():
     """List running Python worker processes."""

@@ -183,6 +183,26 @@ def stop_scraper(req: StopRequest):
     }
 
 
+@router.post("/stop-all")
+def stop_all_scrapers():
+    """Stop ALL running scraper containers."""
+    _require_docker()
+    try:
+        r = subprocess.run(
+            ["docker", "ps", "-q", "--filter", "ancestor=gosom/google-maps-scraper:latest"],
+            capture_output=True, text=True, timeout=10, encoding="utf-8", errors="replace",
+        )
+        ids = [cid.strip() for cid in (r.stdout or "").splitlines() if cid.strip()]
+        stopped = []
+        for cid in ids:
+            subprocess.run(["docker", "stop", cid], capture_output=True, timeout=30,
+                           encoding="utf-8", errors="replace")
+            stopped.append(cid)
+        return {"status": "ok", "stopped": stopped}
+    except Exception as e:
+        raise HTTPException(500, f"Failed to stop scrapers: {e}")
+
+
 @router.get("/logs")
 def scraper_logs(
     db: str = Depends(db_param),
