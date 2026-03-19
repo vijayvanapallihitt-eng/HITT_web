@@ -74,8 +74,14 @@ def get_embedder(backend: str, model: str, dim: int) -> Callable[[list[str]], li
             raise SystemExit("OpenAI key not set. Use OPENAI_API_KEY (or OPENAI_KEY) in env/.env.")
         client = OpenAI(api_key=api_key)
 
+        # text-embedding-3-small supports up to 8191 tokens.
+        # Worst case: 1 token per char (URLs, code, special chars).
+        # Safe limit: 6000 chars guarantees we stay well under 8191 tokens.
+        MAX_CHARS = 6_000
+
         def _embed_openai(texts: list[str]) -> list[list[float]]:
-            res = client.embeddings.create(model=model, input=texts)
+            safe_texts = [t[:MAX_CHARS] if len(t) > MAX_CHARS else t for t in texts]
+            res = client.embeddings.create(model=model, input=safe_texts)
             return [item.embedding for item in res.data]
 
         return _embed_openai

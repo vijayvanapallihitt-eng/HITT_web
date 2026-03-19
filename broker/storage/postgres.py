@@ -10,7 +10,12 @@ from typing import Any, Iterator
 import psycopg2
 
 from broker.config import get_local_construction_dsn
-from broker.models import DocumentChunkRecord, DocumentRecord, LinkCandidateRecord
+from broker.models import (
+    CompanyEvaluationRecord,
+    DocumentChunkRecord,
+    DocumentRecord,
+    LinkCandidateRecord,
+)
 
 
 RESULT_ID_SQL_TYPES = {
@@ -73,7 +78,7 @@ def build_schema_statements(results_id_sql_type: str) -> list[str]:
             CONSTRAINT uq_link_candidates_result_source_url
                 UNIQUE (result_id, source_type, url_discovered),
             CONSTRAINT ck_link_candidates_source_type
-                CHECK (source_type IN ('news'))
+                CHECK (source_type IN ('news', 'website', 'web_research'))
         )
         """,
         """
@@ -154,6 +159,30 @@ def build_schema_statements(results_id_sql_type: str) -> list[str]:
         CREATE INDEX IF NOT EXISTS idx_document_chunks_embedded_at
         ON document_chunks(embedded_at DESC)
         """,
+        f"""
+        CREATE TABLE IF NOT EXISTS company_evaluations (
+            id BIGSERIAL PRIMARY KEY,
+            result_id {results_id_sql_type} NOT NULL REFERENCES results(id) ON DELETE CASCADE,
+            company TEXT NOT NULL DEFAULT '',
+            estimated_revenue TEXT NOT NULL DEFAULT '',
+            revenue_confidence TEXT NOT NULL DEFAULT '',
+            estimated_headcount TEXT NOT NULL DEFAULT '',
+            headcount_confidence TEXT NOT NULL DEFAULT '',
+            evidence_summary TEXT NOT NULL DEFAULT '',
+            chunks_used INTEGER NOT NULL DEFAULT 0,
+            evaluated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT uq_company_evaluations_result
+                UNIQUE (result_id)
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_company_evaluations_result_id
+        ON company_evaluations(result_id)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_company_evaluations_evaluated_at
+        ON company_evaluations(evaluated_at DESC)
+        """,
     ]
 
 
@@ -168,7 +197,7 @@ def ensure_pipeline_schema(dsn: str | None = None) -> dict[str, Any]:
         results_id_sql_type = get_results_id_sql_type(cur)
         existed_before = {
             name: table_exists(cur, name)
-            for name in ("link_candidates", "documents", "document_chunks")
+            for name in ("link_candidates", "documents", "document_chunks", "company_evaluations")
         }
 
         for statement in build_schema_statements(results_id_sql_type):
@@ -178,7 +207,7 @@ def ensure_pipeline_schema(dsn: str | None = None) -> dict[str, Any]:
 
         existed_after = {
             name: table_exists(cur, name)
-            for name in ("link_candidates", "documents", "document_chunks")
+            for name in ("link_candidates", "documents", "document_chunks", "company_evaluations")
         }
         cur.close()
 
@@ -191,7 +220,7 @@ def ensure_pipeline_schema(dsn: str | None = None) -> dict[str, Any]:
                 "existed_before": existed_before[name],
                 "exists_now": existed_after[name],
             }
-            for name in ("link_candidates", "documents", "document_chunks")
+            for name in ("link_candidates", "documents", "document_chunks", "company_evaluations")
         ],
     }
 
@@ -375,6 +404,57 @@ def count_results_pending_link_discovery(conn) -> int:
           AND NOT EXISTS (
               SELECT 1 FROM link_candidates lc
               WHERE lc.result_id = r.id AND lc.source_type = 'news'
+          )
+        """
+    )
+    remaining = int(cur.fetchone()[0] or 0)
+    cur.close()
+    return remaining
+
+
+def select_results_pending_website_discovery(conn, batch_size: int) -> list[dict[str, Any]]:
+    """Return results that have a web_site URL but no 'website' link_candidate yet."""
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT
+            r.id,
+            r.data->>'title' AS company,
+            r.data->>'web_site' AS web_site
+        FROM results r
+        WHERE COALESCE(r.data->>'web_site', '') <> ''
+          AND NOT EXISTS (
+              SELECT 1 FROM link_candidates lc
+              WHERE lc.result_id = r.id AND lc.source_type = 'website'
+          )
+        ORDER BY r.id
+        LIMIT %s
+        FOR UPDATE OF r SKIP LOCKED
+        """,
+        (batch_size,),
+    )
+    rows = cur.fetchall()
+    cur.close()
+    return [
+        {
+            "result_id": int(row[0]),
+            "company": str(row[1] or "").strip(),
+            "web_site": str(row[2] or "").strip(),
+        }
+        for row in rows
+    ]
+
+
+def count_results_pending_website_discovery(conn) -> int:
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT COUNT(*)
+        FROM results r
+        WHERE COALESCE(r.data->>'web_site', '') <> ''
+          AND NOT EXISTS (
+              SELECT 1 FROM link_candidates lc
+              WHERE lc.result_id = r.id AND lc.source_type = 'website'
           )
         """
     )
@@ -711,6 +791,100 @@ def count_documents_pending_chunking(
     count = int(cur.fetchone()[0] or 0)
     cur.close()
     return count
+
+
+# ---------------------------------------------------------------------------
+# Company Evaluation helpers
+# ---------------------------------------------------------------------------
+
+def select_results_pending_evaluation(conn, batch_size: int) -> list[dict[str, Any]]:
+    """Return results that have embedded chunks but no evaluation yet."""
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT DISTINCT r.id, COALESCE(r.data->>'title', '') AS company
+        FROM results r
+        JOIN link_candidates lc ON lc.result_id = r.id
+        JOIN documents d ON d.link_candidate_id = lc.id
+        JOIN document_chunks dc ON dc.document_id = d.id
+        WHERE dc.embedded_at IS NOT NULL
+          AND COALESCE(r.data->>'title', '') <> ''
+          AND NOT EXISTS (
+              SELECT 1 FROM company_evaluations ce WHERE ce.result_id = r.id
+          )
+        ORDER BY r.id
+        LIMIT %s
+        """,
+        (batch_size,),
+    )
+    rows = cur.fetchall()
+    cur.close()
+    return [{"result_id": int(row[0]), "company": str(row[1]).strip()} for row in rows]
+
+
+def count_results_pending_evaluation(conn) -> int:
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT COUNT(DISTINCT r.id)
+        FROM results r
+        JOIN link_candidates lc ON lc.result_id = r.id
+        JOIN documents d ON d.link_candidate_id = lc.id
+        JOIN document_chunks dc ON dc.document_id = d.id
+        WHERE dc.embedded_at IS NOT NULL
+          AND COALESCE(r.data->>'title', '') <> ''
+          AND NOT EXISTS (
+              SELECT 1 FROM company_evaluations ce WHERE ce.result_id = r.id
+          )
+        """
+    )
+    count = int(cur.fetchone()[0] or 0)
+    cur.close()
+    return count
+
+
+def upsert_company_evaluation(conn, record: CompanyEvaluationRecord) -> int:
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO company_evaluations (
+            result_id, company,
+            estimated_revenue, revenue_confidence,
+            estimated_headcount, headcount_confidence,
+            evidence_summary, chunks_used, evaluated_at
+        ) VALUES (
+            %(result_id)s, %(company)s,
+            %(estimated_revenue)s, %(revenue_confidence)s,
+            %(estimated_headcount)s, %(headcount_confidence)s,
+            %(evidence_summary)s, %(chunks_used)s, %(evaluated_at)s
+        )
+        ON CONFLICT (result_id)
+        DO UPDATE SET
+            company = EXCLUDED.company,
+            estimated_revenue = EXCLUDED.estimated_revenue,
+            revenue_confidence = EXCLUDED.revenue_confidence,
+            estimated_headcount = EXCLUDED.estimated_headcount,
+            headcount_confidence = EXCLUDED.headcount_confidence,
+            evidence_summary = EXCLUDED.evidence_summary,
+            chunks_used = EXCLUDED.chunks_used,
+            evaluated_at = EXCLUDED.evaluated_at
+        RETURNING id
+        """,
+        {
+            "result_id": record.result_id,
+            "company": record.company,
+            "estimated_revenue": record.estimated_revenue,
+            "revenue_confidence": record.revenue_confidence,
+            "estimated_headcount": record.estimated_headcount,
+            "headcount_confidence": record.headcount_confidence,
+            "evidence_summary": record.evidence_summary,
+            "chunks_used": record.chunks_used,
+            "evaluated_at": record.evaluated_at or now_utc(),
+        },
+    )
+    row_id = int(cur.fetchone()[0])
+    cur.close()
+    return row_id
 
 
 def print_json(data: Any) -> None:

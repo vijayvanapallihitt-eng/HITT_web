@@ -31,6 +31,11 @@ signal.signal(signal.SIGTERM, _handle_signal)
 
 
 def run(args) -> None:
+    # If --dsn override provided, inject into env so connect_postgres() picks it up
+    if getattr(args, 'dsn', None) and args.dsn:
+        import os as _os
+        _os.environ['BROKER_CONSTRUCTION_DSN'] = args.dsn
+
     status_file = Path(args.status_file)
     status = init_status(args)
     save_json(status_file, status)
@@ -39,7 +44,7 @@ def run(args) -> None:
     total_chunk_processed = 0
 
     try:
-        ensure_pipeline_schema()
+        ensure_pipeline_schema(dsn=getattr(args, 'dsn', None) or None)
         while not _shutdown:
             result = run_document_ingest_cycle(args, status, status_file)
             total_fetch_processed += result["fetch"]["processed"]
@@ -116,6 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     run_parser = sub.add_parser("run", help="Fetch, chunk, embed, and upsert from Postgres.")
+    run_parser.add_argument("--dsn", default="", help="PostgreSQL DSN override. If empty, uses .env / default.")
     run_parser.add_argument("--persist-dir", default=str(CHROMA_DIR / "chroma_smoke_db"))
     run_parser.add_argument("--collection", default="construction_docs_db")
     run_parser.add_argument("--fetch-batch", type=int, default=25)

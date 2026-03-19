@@ -113,24 +113,46 @@ def classify_fetch_status(result: dict) -> str:
         return "http_error"
     return "request_error"
 
+# Words that are too generic to count as evidence of relevance
+_GENERIC_WORDS = {
+    "construction", "contractor", "contracting", "builders", "building",
+    "homes", "home", "group", "company", "companies", "corp", "corporation",
+    "inc", "llc", "ltd", "services", "service", "general", "custom",
+    "design", "build", "remodeling", "renovation", "renovations",
+    "residential", "commercial", "industrial", "roofing", "concrete",
+    "plumbing", "electrical", "hvac", "painting", "landscaping",
+    "the", "and", "new", "york", "city", "nyc", "texas",
+}
+
 
 def _company_relevant(company: str, text: str, title: str) -> bool:
     """Return True if the fetched page appears relevant to the company.
 
-    Checks whether any significant word (3+ chars) from the company name
-    appears in the first 5 000 characters of the page text or in the title.
-    This catches garbage pages (alphabet songs, dictionaries, Stack Overflow)
-    that slip through Bing for short company names like "A. Ruiz Construction".
+    Requires at least one *distinctive* word from the company name (i.e. not a
+    generic industry term like "Construction" or "Homes") to appear in the
+    page text/title.  If the company name only has generic words, falls back to
+    checking if the full company name appears as-is.
     """
     if not company or not text:
         return False
     # Strip punctuation, split into tokens, keep words >= 3 chars
     tokens = re.findall(r"[A-Za-z]{3,}", company)
     if not tokens:
-        # Very short company name — can't gate, let it through
         return True
-    haystack = (title + " " + text[:5000]).lower()
-    return any(tok.lower() in haystack for tok in tokens)
+
+    haystack = (title + " " + text[:8000]).lower()
+
+    # Separate distinctive vs generic tokens
+    distinctive = [t for t in tokens if t.lower() not in _GENERIC_WORDS]
+    generic = [t for t in tokens if t.lower() in _GENERIC_WORDS]
+
+    if distinctive:
+        # At least one distinctive word must appear
+        return any(tok.lower() in haystack for tok in distinctive)
+    else:
+        # All words are generic (e.g. "General Construction Company")
+        # Require the full name to appear
+        return company.lower().strip() in haystack
 
 
 def resolve_candidate_fetch_url(session: requests.Session, candidate: dict, timeout: int) -> str:

@@ -1,6 +1,7 @@
 beautifulsoup4==4.14.3
 chromadb==1.5.2
-google-news-scraper==0.1.0
+crawl4ai==0.8.0
+google-news-scraper @ https://github.com/oxylabs/google-news-scraper/archive/refs/heads/main.zip
 googlenewsdecoder==0.1.7
 openai==2.24.0
 pandas==2.3.3

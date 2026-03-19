@@ -49,6 +49,7 @@ SCRAPER_NAME = "construction-scraper"
 ENRICHER_SCRIPT = os.path.join(WORK_DIR, "worker_enrich.py")
 DEDUP_SCRIPT = os.path.join(WORK_DIR, "worker_dedup.py")
 DOCUMENT_INGEST_SCRIPT = os.path.join(WORK_DIR, "scripts", "run_document_ingest.py")
+UNIFIED_SCRIPT = os.path.join(WORK_DIR, "worker_unified.py")
 
 _children: list[subprocess.Popen] = []
 _shutdown = False
@@ -237,8 +238,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--document-chunk-batch", type=int, default=25, help="Document-ingest chunk batch size")
     parser.add_argument("--document-poll", type=int, default=30, help="Document-ingest poll interval")
     parser.add_argument("--document-persist-dir", type=str, default=str(CHROMA_DIR / "chroma_smoke_db"), help="Chroma persist dir for DB ingest")
-    parser.add_argument("--document-collection", type=str, default="construction_docs_db", help="Chroma collection for DB ingest")
-    parser.add_argument("--document-embedding-backend", type=str, default="simple", help="Embedding backend for DB ingest")
+    parser.add_argument("--document-collection", type=str, default="construction_docs_openai1536_live", help="Chroma collection for DB ingest")
+    parser.add_argument("--document-embedding-backend", type=str, default="openai", help="Embedding backend for DB ingest")
     parser.add_argument("--document-embedding-model", type=str, default="text-embedding-3-small", help="Embedding model for DB ingest")
     parser.add_argument("--document-simple-dim", type=int, default=384, help="Simple embedding dimension for DB ingest")
     parser.add_argument("--document-env-file", type=str, default="", help="Optional .env path for DB ingest")
@@ -246,6 +247,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--dedup-poll", type=int, default=60, help="Dedup poll interval")
     parser.add_argument("--dedup-dsn", type=str, default=LOCAL_DSN, help="PostgreSQL DSN for dedup worker")
+
+    # ── Unified mode (replaces enricher + document-ingest with single flow) ──
+    parser.add_argument("--unified", action="store_true",
+                        help="Use unified pipeline (discover+fetch+chunk+embed in one flow per company)")
+    parser.add_argument("--unified-batch", type=int, default=10, help="Unified worker: companies per cycle")
+    parser.add_argument("--unified-poll", type=int, default=20, help="Unified worker: poll interval")
+    parser.add_argument("--unified-news-top", type=int, default=10, help="Unified worker: news URLs per company")
+    parser.add_argument("--unified-collection", type=str,
+                        default="construction_docs_openai1536_live", help="Unified worker: Chroma collection")
+    parser.add_argument("--unified-embedding-backend", type=str, default="openai",
+                        help="Unified worker: embedding backend")
+    parser.add_argument("--unified-embedding-model", type=str,
+                        default="text-embedding-3-small", help="Unified worker: embedding model")
+    parser.add_argument("--unified-persist-dir", type=str,
+                        default=str(CHROMA_DIR / "chroma_smoke_db"), help="Unified worker: Chroma dir")
     return parser
 
 
@@ -254,7 +270,10 @@ def main() -> None:
 
     log.info("=" * 60)
     log.info("Construction Lead Pipeline")
-    log.info("Scraper -> Discovery -> Document Ingest -> Dedup")
+    if args.unified:
+        log.info("Mode: UNIFIED (Scraper -> Discover+Fetch+Embed -> Dedup)")
+    else:
+        log.info("Mode: Legacy  (Scraper -> Discovery -> Document Ingest -> Dedup)")
     log.info("Started at: %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     log.info("=" * 60)
 
@@ -273,52 +292,79 @@ def main() -> None:
         log.info("Waiting 10s for scraper initialization.")
         time.sleep(10)
 
-    if not args.no_enricher:
+    if args.unified:
+        # ── Unified mode: single worker does discover + fetch + chunk + embed ──
+        log.info("Using UNIFIED pipeline mode.")
         proc = start_worker(
-            ENRICHER_SCRIPT,
-            "Link Discovery Worker",
+            UNIFIED_SCRIPT,
+            "Unified Pipeline Worker",
             extra_args=[
-                "--top",
-                str(args.enrich_top),
                 "--batch",
-                str(args.enrich_batch),
+                str(args.unified_batch),
                 "--poll",
-                str(args.enrich_poll),
-            ],
-        )
-        processes["DISCOVERY"] = proc
-        _children.append(proc)
-
-    if not args.no_document_ingest:
-        proc = start_worker(
-            DOCUMENT_INGEST_SCRIPT,
-            "Document Ingest Worker",
-            extra_args=[
-                "run",
-                "--fetch-batch",
-                str(args.document_fetch_batch),
-                "--chunk-batch",
-                str(args.document_chunk_batch),
-                "--poll",
-                str(args.document_poll),
-                "--persist-dir",
-                args.document_persist_dir,
+                str(args.unified_poll),
+                "--news-top",
+                str(args.unified_news_top),
                 "--collection",
-                args.document_collection,
+                args.unified_collection,
                 "--embedding-backend",
-                args.document_embedding_backend,
+                args.unified_embedding_backend,
                 "--embedding-model",
-                args.document_embedding_model,
-                "--simple-dim",
-                str(args.document_simple_dim),
-                "--env-file",
-                args.document_env_file,
-                "--status-file",
-                args.document_status_file,
+                args.unified_embedding_model,
+                "--persist-dir",
+                args.unified_persist_dir,
             ],
         )
-        processes["DOCINGEST"] = proc
+        processes["UNIFIED"] = proc
         _children.append(proc)
+    else:
+        # ── Legacy mode: separate enricher + document-ingest workers ──
+        if not args.no_enricher:
+            proc = start_worker(
+                ENRICHER_SCRIPT,
+                "Link Discovery Worker",
+                extra_args=[
+                    "--top",
+                    str(args.enrich_top),
+                    "--batch",
+                    str(args.enrich_batch),
+                    "--poll",
+                    str(args.enrich_poll),
+                ],
+            )
+            processes["DISCOVERY"] = proc
+            _children.append(proc)
+
+        if not args.no_document_ingest:
+            proc = start_worker(
+                DOCUMENT_INGEST_SCRIPT,
+                "Document Ingest Worker",
+                extra_args=[
+                    "run",
+                    "--fetch-batch",
+                    str(args.document_fetch_batch),
+                    "--chunk-batch",
+                    str(args.document_chunk_batch),
+                    "--poll",
+                    str(args.document_poll),
+                    "--persist-dir",
+                    args.document_persist_dir,
+                    "--collection",
+                    args.document_collection,
+                    "--embedding-backend",
+                    args.document_embedding_backend,
+                    "--embedding-model",
+                    args.document_embedding_model,
+                    "--simple-dim",
+                    str(args.document_simple_dim),
+                    "--env-file",
+                    args.document_env_file,
+                    "--status-file",
+                    args.document_status_file,
+                ],
+            )
+            processes["DOCINGEST"] = proc
+            _children.append(proc)
 
     if not args.no_dedup:
         proc = start_worker(

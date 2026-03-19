@@ -1,0 +1,53 @@
+# =============================================================================
+# Broker Pipeline — docker-compose
+#
+# Usage:
+#   1. Copy .env.example → .env and fill in OPENAI_API_KEY
+#   2. docker compose up -d --build
+#   3. Open http://localhost:8000
+# =============================================================================
+
+services:
+  # ── PostgreSQL ─────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    ports:
+      - "${POSTGRES_PORT_EXTERNAL:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── Broker API + Frontend ──────────────────────────────────────────────────
+  broker:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${BROKER_PORT:-8000}:8000"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      CHROMA_DIR: /app/runtime/chroma
+    volumes:
+      - chroma_data:/app/runtime/chroma
+      - broker_runtime:/app/runtime
+      - ./queries:/app/queries
+      - ./data:/app/data
+
+volumes:
+  pgdata:
+  chroma_data:
+  broker_runtime:

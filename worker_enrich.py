@@ -1,10 +1,10 @@
 """
-Link discovery worker (news-only).
+Link discovery & website spider worker.
 
 Every poll cycle it:
-  1. Selects `results` rows that are still missing news discovery.
-  2. Uses shared link discovery to find news article URLs.
-  3. Writes discoveries into `link_candidates`.
+  1. Selects `results` rows missing news discovery → searches Google News → writes link_candidates.
+  2. Selects `results` rows missing website discovery → spiders company site with crawl4ai →
+     writes link_candidates + pre-fetched documents (so the ingester skips re-fetching).
 
 Usage:
     python worker_enrich.py
@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import random
 import signal
@@ -27,11 +28,14 @@ import requests
 from broker.config import get_local_construction_dsn
 from broker.enrichment.link_discovery import discover_company_links
 from broker.enrichment.proxies import ProxyPool, fetch_proxifly_proxies, load_proxy_file
-from broker.models import LinkCandidateRecord
+from broker.models import DocumentRecord, LinkCandidateRecord
 from broker.storage.postgres import (
     count_results_pending_link_discovery,
+    count_results_pending_website_discovery,
     ensure_pipeline_schema,
+    insert_document,
     select_results_pending_link_discovery,
+    select_results_pending_website_discovery,
     upsert_link_candidate,
 )
 
@@ -43,7 +47,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-DSN = get_local_construction_dsn()
+DSN: str = get_local_construction_dsn()
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -221,12 +225,108 @@ def poll_and_enrich(args, proxy_pool: ProxyPool | None) -> dict[str, int]:
         conn.close()
 
 
+def seed_website_candidates(batch_size: int) -> int:
+    """Spider company websites with crawl4ai and seed each page as a link_candidate.
+    The document ingester will then chunk and embed them automatically."""
+    from broker.documents.website_spider import crawl_company_website
+
+    conn = psycopg2.connect(DSN)
+    conn.autocommit = False
+    seeded = 0
+    try:
+        rows = select_results_pending_website_discovery(conn, batch_size)
+        if not rows:
+            return 0
+
+        for row in rows:
+            url = row["web_site"].strip()
+            if not url:
+                continue
+            # Normalise bare domains → https://
+            if not url.startswith(("http://", "https://")):
+                url = f"https://{url}"
+
+            company = row["company"]
+            result_id = row["result_id"]
+
+            log.info("  Spidering website for %s: %s", company, url)
+
+            # Use crawl4ai to spider the website (homepage + subpages)
+            try:
+                pages = crawl_company_website(url, timeout=20)
+            except Exception as exc:
+                log.warning("  crawl4ai spider failed for %s: %s — falling back to homepage only", company, exc)
+                pages = []
+
+            if pages:
+                # Seed each discovered page as a separate link_candidate
+                # AND store the already-fetched text in documents so the ingester
+                # skips re-fetching and goes straight to chunking + embedding.
+                for page in pages:
+                    lc_id = upsert_link_candidate(
+                        conn,
+                        LinkCandidateRecord(
+                            result_id=result_id,
+                            source_type="website",
+                            query_text=f"company website: {company}",
+                            url_discovered=page["url"],
+                            title_discovered=page.get("title", "")[:500] or f"{company} — Website",
+                            discovery_status="ok",
+                        ),
+                    )
+                    # Store pre-fetched text as a document
+                    text = page.get("text", "")
+                    insert_document(
+                        conn,
+                        DocumentRecord(
+                            link_candidate_id=lc_id,
+                            url_fetched=page["url"],
+                            page_title=page.get("title", "")[:500] or "",
+                            fetch_status="ok",
+                            http_status=200,
+                            text_hash=hashlib.sha1(text.encode()).hexdigest(),
+                            raw_text=text,
+                        ),
+                    )
+                    seeded += 1
+                log.info("  Seeded %d pages from %s for %s", len(pages), url, company)
+            else:
+                # Fallback: just seed the homepage URL for the ingester to fetch
+                upsert_link_candidate(
+                    conn,
+                    LinkCandidateRecord(
+                        result_id=result_id,
+                        source_type="website",
+                        query_text=f"company website: {company}",
+                        url_discovered=url,
+                        title_discovered=f"{company} — Official Website",
+                        discovery_status="ok",
+                    ),
+                )
+                seeded += 1
+                log.info("  Fallback: seeded homepage only for %s", company)
+
+            conn.commit()
+
+        log.info("  Total website pages seeded: %d", seeded)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return seeded
+
+
 def run(args) -> None:
-    ensure_pipeline_schema()
+    global DSN
+    if getattr(args, 'dsn', None):
+        DSN = args.dsn
+        log.info("  DSN override: %s", DSN)
+    ensure_pipeline_schema(dsn=DSN)
     proxy_pool = build_proxy_pool(no_proxifly=args.no_proxifly, proxy_file=args.proxy_file)
 
     log.info("=" * 55)
-    log.info("  Link Discovery Worker started  (news-only)")
+    log.info("  Link Discovery Worker started  (news + website)")
     log.info("  Poll interval : %ss", args.poll)
     log.info("  Batch size    : %s", args.batch)
     log.info("  News top      : %s", args.news_top)
@@ -240,6 +340,11 @@ def run(args) -> None:
 
     while not _shutdown:
         try:
+            # Seed company website URLs (fast, no HTTP needed)
+            website_seeded = seed_website_candidates(args.batch)
+            if website_seeded:
+                log.info("  Website URLs seeded: %d", website_seeded)
+
             stats = poll_and_enrich(args, proxy_pool=proxy_pool)
             consecutive_errors = 0
         except Exception as exc:
@@ -293,6 +398,12 @@ def run(args) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Link discovery worker daemon (news-only)")
+    parser.add_argument(
+        "--dsn",
+        type=str,
+        default="",
+        help="PostgreSQL DSN override. If empty, uses .env / default.",
+    )
     parser.add_argument(
         "--news-top",
         type=int,

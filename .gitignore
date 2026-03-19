@@ -1,5 +1,8 @@
 .env
+.env.*
+!.env.example
 .venv/
+venv/
 
 __pycache__/
 *.pyc
@@ -24,3 +27,18 @@ smoke_*.csv
 reference/
 
 run_*status*.json
+
+# Temp / scratch files
+_tmp_*
+_test_*
+tmp_*
+proxy_test.txt
+proxies/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+.vite/
+
+# Generated query files
+queries/pipeline_*.txt

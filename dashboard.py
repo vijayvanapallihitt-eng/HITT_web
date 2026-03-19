@@ -47,11 +47,11 @@ VENV_PYTHON = str(PROJECT_ROOT / ".venv" / "Scripts" / "python.exe")
 from dotenv import load_dotenv as _load_dotenv
 _load_dotenv(dotenv_path=PROJECT_ROOT / ".env", override=False)
 
-_ENV_DSN = os.getenv("BROKER_CONSTRUCTION_DSN", "postgresql://postgres:postgres@localhost:5433/construction")
+_ENV_DSN = os.getenv("BROKER_CONSTRUCTION_DSN", "postgresql://postgres:postgres@localhost:5432/construction")
 _ENV_DB_NAME = _ENV_DSN.rsplit("/", 1)[-1] if "/" in _ENV_DSN else "construction"
 
 # Derive host:port from the env DSN so everything stays consistent
-_parsed_dsn = _ENV_DSN.split("@")[-1].rsplit("/", 1)[0] if "@" in _ENV_DSN else "localhost:5433"
+_parsed_dsn = _ENV_DSN.split("@")[-1].rsplit("/", 1)[0] if "@" in _ENV_DSN else "localhost:5432"
 ADMIN_DSN = f"postgresql://postgres:postgres@{_parsed_dsn}/postgres"
 
 
@@ -239,6 +239,9 @@ def run_query(sql: str, params=None) -> pd.DataFrame:
         return pd.read_sql(sql, get_conn(), params=params)
     except (psycopg2.InterfaceError, psycopg2.OperationalError):
         return pd.read_sql(sql, _force_reconnect(), params=params)
+    except psycopg2.Error:
+        _force_reconnect()
+        raise
 
 
 def run_scalar(sql: str, params=None):
@@ -254,6 +257,9 @@ def run_scalar(sql: str, params=None):
         val = cur.fetchone()[0]
         cur.close()
         return val
+    except psycopg2.Error:
+        _force_reconnect()
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +352,7 @@ page = st.sidebar.radio(
         "🔍 Company Browser",
         "⚙️ Enrichment Monitor",
         "🧠 Vector Search",
+        "📈 Company Evaluations",
         "🚀 Scrape Queries",
     ],
 )
@@ -362,28 +369,46 @@ if page == "📊 Overview":
     with st.expander("🏛️ How the pipeline works", expanded=False):
         st.markdown("""
         ```
-        ┌──────────────────┐     ┌────────────────────┐     ┌───────────────────────┐     ┌──────────────┐
-        │  Google Maps     │     │  worker_enrich.py   │     │  run_document_ingest  │     │  ChromaDB    │
-        │  Scraper         │────▶│  (Google News)      │────▶│  (fetch/chunk/embed)  │────▶│  Vector DB   │
-        │  (Docker)        │     │                     │     │                       │     │              │
-        │                  │     │  results ──▶        │     │  link_candidates ──▶  │     │  query via   │
-        │  ──▶ results     │     │  link_candidates    │     │  documents ──▶        │     │  Vector      │
-        │     (21K+ cos)   │     │  (URLs to fetch)    │     │  document_chunks ──▶  │     │  Search page │
-        └──────────────────┘     └────────────────────┘     └───────────────────────┘     └──────────────┘
+        ┌──────────────┐   ┌──────────────┐   ┌──────────────────┐   ┌──────────────┐   ┌──────────────┐
+        │ Google Maps  │   │ worker_      │   │ run_document_    │   │ ChromaDB     │   │ worker_      │
+        │ Scraper      │──▶│ enrich.py    │──▶│ ingest           │──▶│ Vector DB    │──▶│ evaluate.py  │
+        │ (Docker)     │   │ (News + Web) │   │ (fetch/chunk)    │   │              │   │ (GPT-4o-mini)│
+        │              │   │              │   │                  │   │              │   │              │
+        │ ──▶ results  │   │ ──▶ link_    │   │ ──▶ documents   │   │ ──▶ vectors  │   │ ──▶ company_ │
+        │   (JSONB)    │   │  candidates  │   │ ──▶ doc_chunks  │   │   (1536-dim) │   │  evaluations │
+        └──────────────┘   └──────────────┘   └──────────────────┘   └──────────────┘   └──────────────┘
+              │                   │                    │                    │                    │
+              │                   │                    │                    │                    │
+         Google Maps         Google News          Fetches URLs,       OpenAI embed        Pulls ALL chunks
+         queries →           articles +           extracts text,      text-embedding-     per company →
+         company name,       company website      chunks (220w),      3-small →           GPT-4o-mini
+         phone, address,     URLs seeded as       embeds via          cosine similarity   extracts revenue,
+         website, rating,    link_candidates      OpenAI → Chroma     search              headcount, evidence
+         category, etc.      (news + website)                                             with article citations
         ```
 
         **Stage 1 — Scrape:** Docker container (`gosom/google-maps-scraper`) runs Google Maps queries
-        → stores company listings as JSONB in `results` table.
+        → stores company listings as JSONB in `results` table (name, phone, website, address, category, rating).
 
-        **Stage 2 — Enrich:** `worker_enrich.py` picks companies, searches Google News
-        for articles → stores discovered URLs in `link_candidates`.
+        **Stage 2 — Enrich:** `worker_enrich.py` does two things:
+        - 📰 **News discovery** — searches Google News for `"Company Name" construction` → stores article URLs
+        - 🌐 **Website seeding** — takes each company's `web_site` from Google Maps → adds it as a link candidate
+        Both go into `link_candidates` with `source_type` = `news` or `website`.
 
-        **Stage 3 — Ingest:** `run_document_ingest.py` fetches those URLs, extracts text, chunks it,
-        embeds with OpenAI `text-embedding-3-small` → stores in `documents`, `document_chunks` (Postgres)
-        and vectors in ChromaDB.
+        **Stage 3 — Ingest:** `run_document_ingest.py` fetches all pending URLs (news articles + company websites),
+        extracts text, chunks it (220 words, 50-word overlap), embeds with OpenAI `text-embedding-3-small` (1536-dim)
+        → stores in `documents`, `document_chunks` (Postgres) and vectors in ChromaDB.
 
-        **Stage 4 — Query:** Ask natural-language questions on the **🧠 Vector Search** page → retrieves
-        relevant chunks → optional GPT-grounded answer.
+        **Stage 4 — Evaluate:** `worker_evaluate.py` pulls **ALL** embedded chunks for each company
+        (news + website content) → sends to GPT-4o-mini for structured extraction → stores revenue estimate,
+        headcount estimate, confidence levels, and evidence summary (with article title + URL citations)
+        in `company_evaluations`.
+
+        **Stage 5 — Query:** Ask natural-language questions on the **🧠 Vector Search** page → retrieves
+        relevant chunks via cosine similarity → optional GPT-grounded answer.
+
+        **View Results:** The **📈 Company Evaluations** page shows all companies in a CSV-style table
+        with filters, revenue/headcount data, confidence levels, and evidence summaries citing source articles.
         """)
 
     # ── Top-level metrics ──────────────────────────────────────────────
@@ -1232,7 +1257,7 @@ elif page == "🚀 Scrape Queries":
     st.caption(f"Target database: **{_active_db()}**  •  Container: `{_scraper_container_name(_active_db())}`")
 
     # ── One-click full pipeline ────────────────────────────────────────
-    if st.button("🚀 Run Full Pipeline (all 4 stages)", type="primary", key="btn_full_pipeline", use_container_width=True):
+    if st.button("🚀 Run Full Pipeline (all 5 stages)", type="primary", key="btn_full_pipeline", use_container_width=True):
         _cname = _scraper_container_name(_active_db())
         _qfiles = sorted(QUERIES_DIR.glob("*.txt"))
         _seed_file = _qfiles[0] if _qfiles else None
@@ -1276,7 +1301,7 @@ elif page == "🚀 Scrape Queries":
             f' --fetch-batch 25 --chunk-batch 25 --poll 10'
             f' --persist-dir runtime/chroma/chroma_smoke_db'
             f' --collection {COLLECTION_NAME}'
-            f' --embedding-backend simple --embedding-model {EMBEDDING_MODEL}'
+            f' --embedding-backend openai --embedding-model {EMBEDDING_MODEL}'
             f' --env-file .env'
             f' --status-file runtime/status/run_document_ingest_status.json'
         )
@@ -1290,12 +1315,22 @@ elif page == "🚀 Scrape Queries":
                          creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
         launched.append("🧹 Dedup")
 
+        # 5. Evaluator
+        eval_cmd = (
+            f'{VENV_PYTHON} worker_evaluate.py --batch 10 --poll 60'
+            f' --chroma-dir runtime/chroma/chroma_smoke_db'
+            f' --collection {COLLECTION_NAME}'
+        )
+        subprocess.Popen(eval_cmd, cwd=str(PROJECT_ROOT), shell=True,
+                         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+        launched.append("📈 Evaluator")
+
         st.success(f"✅ Full pipeline launched: {', '.join(launched)}")
         st.info("📋 Check **Worker Status** section above for live progress.")
 
     st.caption("Or launch individual stages below:")
 
-    run_col1, run_col2, run_col3, run_col4 = st.columns(4)
+    run_col1, run_col2, run_col3, run_col4, run_col5 = st.columns(5)
 
     with run_col1:
         st.markdown("**Step 1 — Scraper** 🐳")
@@ -1351,7 +1386,7 @@ elif page == "🚀 Scrape Queries":
 
     with run_col2:
         st.markdown("**Step 2 — Enricher** 🔗")
-        st.caption("Google News discovery")
+        st.caption("Google News + company website discovery")
         enrich_batch = st.number_input("Batch size", min_value=1, max_value=100, value=25, key="enrich_batch")
         enrich_poll = st.number_input("Poll interval (s)", min_value=5, max_value=300, value=10, key="enrich_poll")
         news_top = st.number_input("News URLs per co.", min_value=1, max_value=20, value=10, key="news_top")
@@ -1383,7 +1418,7 @@ elif page == "🚀 Scrape Queries":
                 f' --fetch-batch {ingest_fetch} --chunk-batch {ingest_chunk} --poll {ingest_poll}'
                 f' --persist-dir runtime/chroma/chroma_smoke_db'
                 f' --collection {COLLECTION_NAME}'
-                f' --embedding-backend simple --embedding-model {EMBEDDING_MODEL}'
+                f' --embedding-backend openai --embedding-model {EMBEDDING_MODEL}'
                 f' --env-file .env'
                 f' --status-file runtime/status/run_document_ingest_status.json'
             )
@@ -1411,6 +1446,36 @@ elif page == "🚀 Scrape Queries":
             with st.expander("Command launched", expanded=False):
                 st.code(cmd, language="shell")
             st.info("📋 Check **Worker Status** section above for live progress.")
+
+    with run_col5:
+        st.markdown("**Step 5 — Evaluator** 📈")
+        st.caption("AI revenue & headcount extraction")
+        eval_batch_sq = st.number_input("Batch size", min_value=1, max_value=100, value=20, key="eval_batch_sq")
+        eval_poll_sq = st.number_input("Poll interval (s)", min_value=5, max_value=300, value=60, key="eval_poll_sq")
+
+        if st.button("📈 Start Evaluator", key="btn_evaluator_sq"):
+            cmd = (
+                f'{VENV_PYTHON} worker_evaluate.py'
+                f' --batch {eval_batch_sq} --poll {eval_poll_sq}'
+                f' --chroma-dir runtime/chroma/chroma_smoke_db'
+                f' --collection {COLLECTION_NAME}'
+            )
+            subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), shell=True,
+                             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+            st.success(f"✅ Evaluator started (batch={eval_batch_sq}, poll={eval_poll_sq}s)")
+            with st.expander("Command launched", expanded=False):
+                st.code(cmd, language="shell")
+
+        if st.button("📈 Run Once", key="btn_evaluator_once_sq"):
+            cmd = (
+                f'{VENV_PYTHON} worker_evaluate.py --once'
+                f' --batch {eval_batch_sq}'
+                f' --chroma-dir runtime/chroma/chroma_smoke_db'
+                f' --collection {COLLECTION_NAME}'
+            )
+            subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), shell=True,
+                             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+            st.success("✅ Single evaluation pass launched")
 
     # ── Stop controls ──────────────────────────────────────────────────
     st.divider()
@@ -1452,6 +1517,294 @@ elif page == "🚀 Scrape Queries":
         subprocess.run(["taskkill", "/F", "/IM", "python.exe", "/FI", "WINDOWTITLE eq run_document_ingest*"], capture_output=True, encoding="utf-8", errors="replace")
         subprocess.run(["taskkill", "/F", "/IM", "python.exe", "/FI", "WINDOWTITLE eq worker_dedup*"], capture_output=True, encoding="utf-8", errors="replace")
         st.info("Sent stop signals to all workers and scraper.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PAGE 6 — Company Evaluations
+# ═══════════════════════════════════════════════════════════════════════════
+
+elif page == "📈 Company Evaluations":
+    st.title("📈 Company Evaluations")
+    st.caption(f"Database: **{_active_db()}** — All companies with AI-extracted revenue & headcount")
+
+    # ── Ensure company_evaluations table exists ────────────────────────
+    _eval_table_exists = False
+    try:
+        run_scalar("SELECT 1 FROM company_evaluations LIMIT 1")
+        _eval_table_exists = True
+    except Exception:
+        # Table doesn't exist yet — create it
+        try:
+            _force_reconnect()
+            _admin_conn = psycopg2.connect(_active_dsn())
+            _admin_conn.autocommit = False
+            _admin_cur = _admin_conn.cursor()
+            _admin_cur.execute("""
+                CREATE TABLE IF NOT EXISTS company_evaluations (
+                    id BIGSERIAL PRIMARY KEY,
+                    result_id INTEGER NOT NULL REFERENCES results(id) ON DELETE CASCADE,
+                    company TEXT NOT NULL DEFAULT '',
+                    estimated_revenue TEXT NOT NULL DEFAULT '',
+                    revenue_confidence TEXT NOT NULL DEFAULT '',
+                    estimated_headcount TEXT NOT NULL DEFAULT '',
+                    headcount_confidence TEXT NOT NULL DEFAULT '',
+                    evidence_summary TEXT NOT NULL DEFAULT '',
+                    chunks_used INTEGER NOT NULL DEFAULT 0,
+                    evaluated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    CONSTRAINT uq_company_evaluations_result UNIQUE (result_id)
+                )
+            """)
+            _admin_cur.execute("CREATE INDEX IF NOT EXISTS idx_company_evaluations_result_id ON company_evaluations(result_id)")
+            _admin_conn.commit()
+            _admin_cur.close()
+            _admin_conn.close()
+            _force_reconnect()
+            _eval_table_exists = True
+            st.success("✅ Created `company_evaluations` table.")
+        except Exception as _create_exc:
+            st.error(f"Could not create company_evaluations table: {_create_exc}")
+            _force_reconnect()
+
+    # ── Summary metrics ────────────────────────────────────────────────
+    if _eval_table_exists:
+        eval_total = run_scalar("SELECT count(*) FROM company_evaluations") or 0
+        eval_with_rev = run_scalar(
+            "SELECT count(*) FROM company_evaluations WHERE estimated_revenue <> 'Unknown' AND estimated_revenue <> ''"
+        ) or 0
+        eval_with_hc = run_scalar(
+            "SELECT count(*) FROM company_evaluations WHERE estimated_headcount <> 'Unknown' AND estimated_headcount <> ''"
+        ) or 0
+    else:
+        eval_total = eval_with_rev = eval_with_hc = 0
+    total_results = run_scalar("SELECT count(*) FROM results") or 0
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total Companies", f"{total_results:,}")
+    m2.metric("Evaluated", f"{eval_total:,}")
+    m3.metric("Revenue Found", f"{eval_with_rev:,}")
+    m4.metric("Headcount Found", f"{eval_with_hc:,}")
+
+    # ── Filters ────────────────────────────────────────────────────────
+    st.divider()
+    ef1, ef2, ef3, ef4 = st.columns([3, 1, 1, 1])
+    with ef1:
+        ev_search = st.text_input("🔎 Search company name", "", key="ev_search")
+    with ef2:
+        try:
+            _ev_cat_rows = run_query("""
+                SELECT DISTINCT data->>'category' AS cat FROM results
+                WHERE data->>'category' IS NOT NULL AND data->>'category' <> '' ORDER BY 1
+            """)
+            _ev_cat_opts = ["All"] + _ev_cat_rows["cat"].tolist()
+        except Exception:
+            _ev_cat_opts = ["All"]
+        ev_cat = st.selectbox("Category", _ev_cat_opts, key="ev_cat")
+    with ef3:
+        try:
+            _ev_state_rows = run_query("""
+                SELECT DISTINCT data->'complete_address'->>'state' AS state FROM results
+                WHERE data->'complete_address'->>'state' IS NOT NULL
+                  AND data->'complete_address'->>'state' <> '' ORDER BY 1
+            """)
+            _ev_state_opts = ["All"] + _ev_state_rows["state"].tolist()
+        except Exception:
+            _ev_state_opts = ["All"]
+        ev_state = st.selectbox("State", _ev_state_opts, key="ev_state")
+    with ef4:
+        ev_eval_filter = st.selectbox("Evaluation", ["All", "Evaluated", "Not evaluated",
+                                                      "Revenue found", "Headcount found"], key="ev_eval")
+
+    ef5, ef6 = st.columns(2)
+    with ef5:
+        ev_rev_conf = st.selectbox("Revenue confidence", ["All", "high", "medium", "low", "none"], key="ev_rc")
+    with ef6:
+        ev_hc_conf = st.selectbox("Headcount confidence", ["All", "high", "medium", "low", "none"], key="ev_hc")
+
+    # ── Build query ────────────────────────────────────────────────────
+    ev_wheres: list[str] = []
+    ev_params: list = []
+    if ev_search.strip():
+        ev_wheres.append("(r.data->>'title' ILIKE %s)")
+        ev_params.append(f"%{ev_search.strip()}%")
+    if ev_cat != "All":
+        ev_wheres.append("r.data->>'category' = %s")
+        ev_params.append(ev_cat)
+    if ev_state != "All":
+        ev_wheres.append("r.data->'complete_address'->>'state' = %s")
+        ev_params.append(ev_state)
+    if ev_eval_filter == "Evaluated":
+        ev_wheres.append("ce.id IS NOT NULL")
+    elif ev_eval_filter == "Not evaluated":
+        ev_wheres.append("ce.id IS NULL")
+    elif ev_eval_filter == "Revenue found":
+        ev_wheres.append("ce.estimated_revenue IS NOT NULL AND ce.estimated_revenue <> 'Unknown' AND ce.estimated_revenue <> ''")
+    elif ev_eval_filter == "Headcount found":
+        ev_wheres.append("ce.estimated_headcount IS NOT NULL AND ce.estimated_headcount <> 'Unknown' AND ce.estimated_headcount <> ''")
+    if ev_rev_conf != "All":
+        ev_wheres.append("ce.revenue_confidence = %s")
+        ev_params.append(ev_rev_conf)
+    if ev_hc_conf != "All":
+        ev_wheres.append("ce.headcount_confidence = %s")
+        ev_params.append(ev_hc_conf)
+
+    ev_where_sql = (" AND ".join(ev_wheres)) if ev_wheres else "TRUE"
+
+    ev_total_matches = run_scalar(f"""
+        SELECT count(*) FROM results r
+        LEFT JOIN company_evaluations ce ON ce.result_id = r.id
+        WHERE {ev_where_sql}
+    """, ev_params)
+    st.caption(f"**{ev_total_matches:,}** matching companies")
+
+    # ── Pagination ─────────────────────────────────────────────────────
+    ev_page_size = 50
+    ev_page_num = st.number_input("Page", min_value=1,
+                                  max_value=max(1, (ev_total_matches // ev_page_size) + 1),
+                                  value=1, key="ev_page")
+    ev_offset = (ev_page_num - 1) * ev_page_size
+
+    ev_df = run_query(f"""
+        SELECT
+            r.id,
+            COALESCE(r.data->>'title', '') AS company,
+            COALESCE(r.data->>'phone', '') AS phone,
+            COALESCE(r.data->>'web_site', '') AS website,
+            COALESCE(r.data->>'address', '') AS address,
+            COALESCE(r.data->>'category', '') AS category,
+            COALESCE(r.data->'complete_address'->>'city', '') AS city,
+            COALESCE(r.data->'complete_address'->>'state', '') AS state,
+            COALESCE(r.data->>'review_rating', '') AS rating,
+            COALESCE(r.data->>'review_count', '') AS reviews,
+            COALESCE(ce.estimated_revenue, '') AS est_revenue,
+            COALESCE(ce.revenue_confidence, '') AS rev_confidence,
+            COALESCE(ce.estimated_headcount, '') AS est_headcount,
+            COALESCE(ce.headcount_confidence, '') AS hc_confidence,
+            COALESCE(ce.evidence_summary, '') AS evidence
+        FROM results r
+        LEFT JOIN company_evaluations ce ON ce.result_id = r.id
+        WHERE {ev_where_sql}
+        ORDER BY r.id
+        LIMIT {ev_page_size} OFFSET {ev_offset}
+    """, ev_params)
+
+    if ev_df.empty:
+        st.info("No companies match your filters.")
+    else:
+        st.dataframe(ev_df, use_container_width=True, hide_index=True, column_config={
+            "id": st.column_config.NumberColumn("ID", width="small"),
+            "company": st.column_config.TextColumn("Company", width="large"),
+            "phone": "Phone",
+            "website": st.column_config.LinkColumn("Website", width="medium"),
+            "address": st.column_config.TextColumn("Address", width="medium"),
+            "category": "Category",
+            "city": "City",
+            "state": "State",
+            "rating": "⭐",
+            "reviews": "Reviews",
+            "est_revenue": st.column_config.TextColumn("Est. Revenue", width="medium"),
+            "rev_confidence": "Rev. Conf.",
+            "est_headcount": st.column_config.TextColumn("Est. Headcount", width="small"),
+            "hc_confidence": "HC Conf.",
+            "evidence": st.column_config.TextColumn("Evidence Summary", width="large"),
+        })
+
+    # ── CSV Export ─────────────────────────────────────────────────────
+    st.divider()
+    if st.button("📥 Export all evaluations to CSV", key="btn_ev_csv"):
+        export_df = run_query("""
+            SELECT
+                r.id,
+                COALESCE(r.data->>'title', '') AS company,
+                COALESCE(r.data->>'phone', '') AS phone,
+                COALESCE(r.data->>'web_site', '') AS website,
+                COALESCE(r.data->>'address', '') AS address,
+                COALESCE(r.data->>'category', '') AS category,
+                COALESCE(r.data->'complete_address'->>'city', '') AS city,
+                COALESCE(r.data->'complete_address'->>'state', '') AS state,
+                COALESCE(r.data->>'review_rating', '') AS rating,
+                COALESCE(r.data->>'review_count', '') AS reviews,
+                COALESCE(ce.estimated_revenue, '') AS est_revenue,
+                COALESCE(ce.revenue_confidence, '') AS rev_confidence,
+                COALESCE(ce.estimated_headcount, '') AS est_headcount,
+                COALESCE(ce.headcount_confidence, '') AS hc_confidence,
+                COALESCE(ce.evidence_summary, '') AS evidence
+            FROM results r
+            LEFT JOIN company_evaluations ce ON ce.result_id = r.id
+            ORDER BY r.id
+        """)
+        if not export_df.empty:
+            csv_data = export_df.to_csv(index=False)
+            st.download_button(
+                "⬇️ Download CSV", csv_data,
+                file_name=f"{_active_db()}_evaluations.csv",
+                mime="text/csv",
+            )
+        else:
+            st.info("No data to export.")
+
+    # ── Confidence charts ──────────────────────────────────────────────
+    if eval_total > 0:
+        st.divider()
+        conf_col1, conf_col2 = st.columns(2)
+        with conf_col1:
+            st.subheader("Revenue Confidence")
+            rev_conf = run_query(
+                "SELECT revenue_confidence AS confidence, count(*) AS cnt "
+                "FROM company_evaluations GROUP BY 1 ORDER BY 2 DESC"
+            )
+            if not rev_conf.empty:
+                colors = {"high": "#22c55e", "medium": "#eab308", "low": "#f97316", "none": "#a3a3a3"}
+                fig_rc = px.pie(rev_conf, values="cnt", names="confidence",
+                               color="confidence", color_discrete_map=colors, hole=0.4)
+                fig_rc.update_layout(height=320, margin=dict(t=20, b=20))
+                st.plotly_chart(fig_rc, use_container_width=True)
+        with conf_col2:
+            st.subheader("Headcount Confidence")
+            hc_conf = run_query(
+                "SELECT headcount_confidence AS confidence, count(*) AS cnt "
+                "FROM company_evaluations GROUP BY 1 ORDER BY 2 DESC"
+            )
+            if not hc_conf.empty:
+                colors = {"high": "#22c55e", "medium": "#eab308", "low": "#f97316", "none": "#a3a3a3"}
+                fig_hc = px.pie(hc_conf, values="cnt", names="confidence",
+                               color="confidence", color_discrete_map=colors, hole=0.4)
+                fig_hc.update_layout(height=320, margin=dict(t=20, b=20))
+                st.plotly_chart(fig_hc, use_container_width=True)
+
+    # ── Launch evaluation worker ───────────────────────────────────────
+    st.divider()
+    st.subheader("🚀 Run Evaluator")
+    st.caption("Queries ChromaDB for each company, extracts revenue & headcount via OpenAI.")
+
+    ev_col1, ev_col2 = st.columns(2)
+    with ev_col1:
+        ev_batch = st.number_input("Batch size", min_value=1, max_value=100, value=10, key="ev_batch")
+    with ev_col2:
+        ev_poll = st.number_input("Poll interval (s)", min_value=5, max_value=300, value=30, key="ev_poll")
+
+    evbtn1, evbtn2 = st.columns(2)
+    with evbtn1:
+        if st.button("📈 Start Evaluator (continuous)", key="btn_evaluator"):
+            ev_cmd = (
+                f'{VENV_PYTHON} worker_evaluate.py'
+                f' --batch {ev_batch} --poll {ev_poll}'
+                f' --chroma-dir runtime/chroma/chroma_smoke_db'
+                f' --collection {COLLECTION_NAME}'
+            )
+            subprocess.Popen(ev_cmd, cwd=str(PROJECT_ROOT), shell=True,
+                             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+            st.success(f"✅ Evaluator started (batch={ev_batch}, poll={ev_poll}s)")
+    with evbtn2:
+        if st.button("📈 Run Once (single pass)", key="btn_evaluator_once"):
+            ev_cmd = (
+                f'{VENV_PYTHON} worker_evaluate.py --once'
+                f' --batch {ev_batch}'
+                f' --chroma-dir runtime/chroma/chroma_smoke_db'
+                f' --collection {COLLECTION_NAME}'
+            )
+            subprocess.Popen(ev_cmd, cwd=str(PROJECT_ROOT), shell=True,
+                             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+            st.success("✅ Single evaluation pass launched — refresh in a moment to see results.")
 
 
 # ── Sidebar footer ─────────────────────────────────────────────────────

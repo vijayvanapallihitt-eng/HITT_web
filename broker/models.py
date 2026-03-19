@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 
-SourceType = Literal["news"]
+SourceType = Literal["news", "website", "web_research"]
 
 
 @dataclass(frozen=True)
@@ -71,3 +71,17 @@ class ChromaChunkMetadata:
     chunk_index: int
     url_fetched: str = ""
     page_title: str = ""
+
+
+@dataclass
+class CompanyEvaluationRecord:
+    result_id: int
+    company: str
+    estimated_revenue: str = ""
+    revenue_confidence: str = ""
+    estimated_headcount: str = ""
+    headcount_confidence: str = ""
+    evidence_summary: str = ""
+    chunks_used: int = 0
+    evaluated_at: datetime | None = None
+    id: int | None = None
