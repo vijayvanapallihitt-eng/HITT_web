@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -147,7 +148,10 @@ def start_scraper(req: StartRequest):
     if req.query_file:
         seed_path = QUERIES_DIR / req.query_file
         if seed_path.exists():
-            _seed_queries_to_db(req.db, seed_path, cname_suffix="seed")
+            seed_result = _seed_queries_to_db(req.db, seed_path, cname_suffix="seed")
+            # Wait for seed to commit to postgres before starting scraper
+            if seed_result.get("status") == "ok":
+                time.sleep(2)
 
     # Start scraper
     scraper_cmd = [
